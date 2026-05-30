@@ -1,5 +1,4 @@
 import os
-import math
 import logging
 from urllib.parse import quote
 from contextlib import asynccontextmanager
@@ -71,15 +70,43 @@ def get_worker():
     worker_index += 1
     return worker
 
-async def stream_generator(client, message_id, offset, limit):
+async def stream_generator(client, message_id, start_byte, end_byte):
+    """Fetches chunks from MTProto and trims them to perfectly match the HTTP Range boundaries."""
     try:
         msg = await client.get_messages(WORKER_CHANNEL, message_id)
-        if not msg or not (msg.video or msg.document):
+        if not msg or not getattr(msg, "media", None):
             yield b""
             return
 
-        async for chunk in client.stream_media(msg, limit=limit, offset=offset):
-            yield chunk
+        chunk_size = 1024 * 1024
+        offset_chunk = start_byte // chunk_size
+        limit_chunks = (end_byte // chunk_size) - offset_chunk + 1
+
+        bytes_to_read = end_byte - start_byte + 1
+        bytes_yielded = 0
+        current_chunk = offset_chunk
+
+        async for chunk in client.stream_media(msg, limit=limit_chunks, offset=offset_chunk):
+            if bytes_yielded >= bytes_to_read:
+                break
+
+            data = chunk
+            chunk_start_absolute = current_chunk * chunk_size
+
+            # Trim the front if this is the first chunk and the requested start byte is inside it
+            if current_chunk == offset_chunk:
+                trim_front = start_byte - chunk_start_absolute
+                if trim_front > 0:
+                    data = data[trim_front:]
+
+            # Trim the back if the chunk contains more data than the client requested
+            if len(data) > (bytes_to_read - bytes_yielded):
+                data = data[:(bytes_to_read - bytes_yielded)]
+
+            yield data
+            bytes_yielded += len(data)
+            current_chunk += 1
+
     except Exception as e:
         logger.error(f"Stream generation error: {e}")
         yield b""
@@ -162,10 +189,6 @@ async def stream_file(request: Request, file_id: int, range: str = Header(None))
         content_length = (end - start) + 1
         worker = get_worker()
         
-        chunk_size = 1024 * 1024
-        offset_chunks = math.floor(start / chunk_size)
-        limit_chunks = math.ceil(content_length / chunk_size)
-
         # URL-Encode filename to securely pass non-Latin characters in HTTP headers
         encoded_name = quote(file_name)
 
@@ -178,7 +201,7 @@ async def stream_file(request: Request, file_id: int, range: str = Header(None))
         }
 
         return StreamingResponse(
-            stream_generator(worker, file_id, offset=offset_chunks, limit=limit_chunks),
+            stream_generator(worker, file_id, start, end),
             status_code=status_code,
             headers=headers
         )
