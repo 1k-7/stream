@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Stream Player</title>
+    <link rel="stylesheet" href="https://cdn.plyr.io/3.7.8/plyr.css" />
+    <style>
+        body, html {
+            margin: 0;
+            padding: 0;
+            width: 100%;
+            height: 100%;
+            background-color: #0b0f19;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            font-family: sans-serif;
+        }
+        .video-container {
+            width: 100%;
+            max-width: 960px;
+            background: #000;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+            border-radius: 8px;
+            overflow: hidden;
+        }
+        /* Custom styling for Plyr to match modern dark look */
+        .plyr--video {
+            --plyr-color-main: #3b82f6;
+        }
+    </style>
+</head>
+<body>
+
+<div class="video-container">
+    <video id="player" playsinline controls crossorigin>
+        <source src="{{ video_url }}" type="video/mp4" />
+    </video>
+</div>
+
+<script src="https://cdn.plyr.io/3.7.8/plyr.js"></script>
+<script>
+    document.addEventListener('DOMContentLoaded', () => {
+        const player = new Plyr('#player', {
+            controls: [
+                'play-large', 'play', 'progress', 'current-time', 
+                'duration', 'mute', 'volume', 'settings', 'pip', 'fullscreen'
+            ],
+            seekTime: 10
+        });
+
+        const videoElement = document.getElementById('player');
+        const plyrContainer = document.querySelector('.plyr');
+
+        // 1. Double Tap to Seek (Mobile)
+        let lastTap = 0;
+        plyrContainer.addEventListener('touchend', function (e) {
+            const currentTime = new Date().getTime();
+            const tapLength = currentTime - lastTap;
+            
+            if (tapLength < 300 && tapLength > 0) {
+                // Prevent default behavior like zoom
+                e.preventDefault();
+                
+                const rect = plyrContainer.getBoundingClientRect();
+                const touchX = e.changedTouches[0].clientX - rect.left;
+                const midPoint = rect.width / 2;
+
+                if (touchX < midPoint) {
+                    // Left side double-tap: Rewind 10s
+                    player.rewind(10);
+                } else {
+                    // Right side double-tap: Forward 10s
+                    player.forward(10);
+                }
+            }
+            lastTap = currentTime;
+        });
+
+        // 2. Auto-Rotate on Fullscreen (Mobile)
+        player.on('enterfullscreen', () => {
+            if (screen.orientation && screen.orientation.lock) {
+                screen.orientation.lock('landscape').catch((err) => {
+                    console.log("Orientation lock not supported or allowed:", err);
+                });
+            }
+        });
+
+        player.on('exitfullscreen', () => {
+            if (screen.orientation && screen.orientation.unlock) {
+                screen.orientation.unlock();
+            }
+        });
+    });
+</script>
+</body>
+</html>

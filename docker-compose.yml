@@ -1,0 +1,17 @@
+version: '3.8'
+
+services:
+  stream-bot:
+    build: .
+    container_name: telegram-stream-bot
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    volumes:
+      # Maps the host's downloads folder to the container's downloads folder
+      # This ensures large files don't blow up your container size
+      - ./downloads:/app/downloads
+      # Maps the session file so you don't re-authenticate with Telegram on every restart
+      - ./stream_bot.session:/app/stream_bot.session
