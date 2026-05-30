@@ -24,6 +24,9 @@ WORKER_TOKENS = os.environ.get("WORKER_TOKENS", "")
 # Absolute path for templates
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
+# Ensure sessions directory exists so Docker mapping doesn't fail
+os.makedirs(os.path.join(BASE_DIR, "sessions"), exist_ok=True)
+
 # --- GLOBALS ---
 bot = None
 workers = []
@@ -85,36 +88,22 @@ async def stream_generator(client, message_id, offset, limit):
 async def lifespan(app: FastAPI):
     global bot
     logger.info("Starting Main Bot...")
-    bot = Client("stream_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+    
+    # Initialize Main Bot with persistent SQLite storage
+    bot = Client("stream_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, workdir="sessions")
     
     bot.add_handler(MessageHandler(start_cmd, filters.command("start")))
     bot.add_handler(MessageHandler(handle_video, filters.video | filters.document))
 
     await bot.start()
     
-    # 1. Force Peer Caching for Main Bot
-    try:
-        init_msg = await bot.send_message(WORKER_CHANNEL, "🔄 System Boot: Caching Main Bot Peer")
-        await init_msg.delete()
-        logger.info("Main Bot peer cached successfully.")
-    except Exception as e:
-        logger.error(f"Failed to cache peer for main bot: {e}")
-
-    # 2. Initialize and Cache Worker Bots
+    # Initialize Worker Bots with persistent SQLite storage
     tokens = [t.strip() for t in WORKER_TOKENS.split(",") if t.strip()]
     for token in tokens:
         try:
             bot_id = token.split(":")[0]
-            w_client = Client(f"worker_{bot_id}", api_id=API_ID, api_hash=API_HASH, bot_token=token, in_memory=True)
+            w_client = Client(f"worker_{bot_id}", api_id=API_ID, api_hash=API_HASH, bot_token=token, workdir="sessions")
             await w_client.start()
-            
-            # Force Peer Caching for Worker Bot
-            try:
-                w_init_msg = await w_client.send_message(WORKER_CHANNEL, f"🔄 System Boot: Caching Worker {bot_id}")
-                await w_init_msg.delete()
-            except Exception as e:
-                logger.error(f"Failed to cache peer for worker {bot_id}: {e}")
-                
             workers.append(w_client)
         except Exception as e:
             logger.error(f"Failed to start worker bot {token[:10]}... : {e}")
