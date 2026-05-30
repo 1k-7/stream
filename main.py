@@ -35,11 +35,7 @@ worker_index = 0
 
 # --- SMART SLIDING WINDOW CACHE ---
 class ChunkCache:
-    """
-    An in-memory LRU cache holding 1MB Telegram media chunks.
-    Prevents duplicate downloads when the browser repeatedly requests overlapping byte windows.
-    """
-    def __init__(self, max_chunks=256):  # 256 Chunks = 256MB RAM Cache
+    def __init__(self, max_chunks=256):
         self.cache = OrderedDict()
         self.max_chunks = max_chunks
         self.lock = asyncio.Lock()
@@ -91,47 +87,46 @@ async def fetch_metadata(file_id: int):
     return meta
 
 async def managed_stream_generator(client, msg, start_byte, end_byte, request: Request):
-    """
-    Advanced Stream Generator featuring strict chunk caching and aggressive 
-    client disconnect detection to completely stop background data drain.
-    """
-    chunk_size = 1024 * 1024  # 1MB Telegram Chunks
+    chunk_size = 1024 * 1024
     start_chunk = start_byte // chunk_size
     end_chunk = end_byte // chunk_size
-    
     file_id = msg.id
 
     try:
         for current_chunk_idx in range(start_chunk, end_chunk + 1):
-            # Check client connectivity before pulling from Telegram
             if await request.is_disconnected():
                 logger.info(f"Client disconnected. Aborting stream for file {file_id}.")
-                return
+                # Raising an error forces Uvicorn to drop the connection rather than
+                # trying to resolve the missing Content-Length bytes.
+                raise asyncio.CancelledError("Client disconnected")
 
             cache_key = f"{file_id}_{current_chunk_idx}"
             chunk_data = await global_chunk_cache.get(cache_key)
 
             if not chunk_data:
-                # Cache miss: Fetch the single chunk directly from Telegram
-                chunk_data = b""
-                try:
-                    async for part in client.stream_media(msg, limit=1, offset=current_chunk_idx):
-                        chunk_data += part
-                    
-                    if chunk_data:
-                        await global_chunk_cache.set(cache_key, chunk_data)
-                except FloodWait as fw:
-                    logger.warning(f"Rate limited. Waiting {fw.value}s...")
-                    await asyncio.sleep(fw.value)
-                    continue
-                except Exception as e:
-                    logger.error(f"Error pulling chunk {current_chunk_idx}: {e}")
-                    break
+                retries = 3
+                while retries > 0:
+                    chunk_data = b""
+                    try:
+                        async for part in client.stream_media(msg, limit=1, offset=current_chunk_idx):
+                            chunk_data += part
+                        
+                        if chunk_data:
+                            await global_chunk_cache.set(cache_key, chunk_data)
+                            break
+                    except FloodWait as fw:
+                        logger.warning(f"Rate limited. Waiting {fw.value}s...")
+                        await asyncio.sleep(fw.value)
+                        retries -= 1
+                    except Exception as e:
+                        logger.error(f"Error pulling chunk {current_chunk_idx}: {e}")
+                        break
 
             if not chunk_data:
-                break
+                logger.error(f"Failed to fetch chunk {current_chunk_idx} from Telegram.")
+                # Missing chunk data must trigger an exception to avoid HTTP protocol mismatch
+                raise RuntimeError("Missing chunk data")
 
-            # Calculate exact slicing window within this specific 1MB chunk
             chunk_start_byte = current_chunk_idx * chunk_size
             slice_start = max(0, start_byte - chunk_start_byte)
             slice_end = min(len(chunk_data), end_byte - chunk_start_byte + 1)
@@ -139,9 +134,11 @@ async def managed_stream_generator(client, msg, start_byte, end_byte, request: R
             yield chunk_data[slice_start:slice_end]
 
     except asyncio.CancelledError:
-        logger.info(f"Stream playback task cancelled by client request.")
+        logger.info("Stream playback task cancelled by client request.")
+        raise  # Re-raise to gracefully sever the HTTP pipeline
     except Exception as e:
-        logger.error(f"Unexpected streaming loop failure: {e}")
+        logger.error(f"Streaming loop failure: {e}")
+        raise  
 
 # --- FASTAPI SETUP & LIFESPAN ---
 @asynccontextmanager
