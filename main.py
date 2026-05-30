@@ -1,6 +1,7 @@
 import os
 import math
 import logging
+from urllib.parse import quote
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, HTTPException, Header
 from fastapi.responses import HTMLResponse, StreamingResponse
@@ -97,6 +98,12 @@ async def lifespan(app: FastAPI):
 
     await bot.start()
     
+    # Safe check to see if the bot has cached the channel peer without crashing the server if it hasn't
+    try:
+        await bot.get_chat(WORKER_CHANNEL)
+    except Exception as e:
+        logger.warning(f"Awaiting manual cache: Please send a regular text message to your WORKER_CHANNEL to cache the peer. ({e})")
+
     # Initialize Worker Bots with persistent SQLite storage
     tokens = [t.strip() for t in WORKER_TOKENS.split(",") if t.strip()]
     for token in tokens:
@@ -159,12 +166,15 @@ async def stream_file(request: Request, file_id: int, range: str = Header(None))
         offset_chunks = math.floor(start / chunk_size)
         limit_chunks = math.ceil(content_length / chunk_size)
 
+        # URL-Encode filename to securely pass non-Latin characters in HTTP headers
+        encoded_name = quote(file_name)
+
         headers = {
             "Content-Range": f"bytes {start}-{end}/{file_size}",
             "Accept-Ranges": "bytes",
             "Content-Length": str(content_length),
             "Content-Type": media.mime_type or "video/mp4",
-            "Content-Disposition": f'inline; filename="{file_name}"',
+            "Content-Disposition": f"inline; filename*=utf-8''{encoded_name}",
         }
 
         return StreamingResponse(
