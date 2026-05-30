@@ -8,6 +8,7 @@ from fastapi.responses import HTMLResponse, FileResponse
 from fastapi.templating import Jinja2Templates
 from pyrogram import Client, filters
 from pyrogram.enums import ParseMode
+from pyrogram.handlers import MessageHandler
 import uvicorn
 
 # --- LOGGING SETUP ---
@@ -28,8 +29,8 @@ FILE_MAX_AGE = 86400
 
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-# Initialize Pyrogram Client
-bot = Client("stream_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+# Global bot instance (initialized later in the active loop)
+bot = None
 
 # --- BACKGROUND TASKS ---
 async def auto_cleanup_task():
@@ -46,35 +47,13 @@ async def auto_cleanup_task():
                         logger.error(f"Error deleting file {filename}: {e}")
         await asyncio.sleep(CLEANUP_INTERVAL)
 
-# --- LIFESPAN MANAGER ---
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # Startup sequence
-    logger.info("Starting Pyrogram Client...")
-    await bot.start()
-    logger.info("Pyrogram successfully connected to MTProto servers.")
-    cleanup_task = asyncio.create_task(auto_cleanup_task())
-    
-    yield # App is actively running and receiving requests/messages
-    
-    # Shutdown sequence
-    logger.info("Stopping Pyrogram Client...")
-    cleanup_task.cancel()
-    await bot.stop()
-
-# Initialize FastAPI with the lifespan manager
-app = FastAPI(lifespan=lifespan)
-templates = Jinja2Templates(directory="templates")
-
 # --- TELEGRAM BOT HANDLERS ---
-@bot.on_message(filters.command("start"))
 async def start_cmd(client, message):
     logger.info(f"Received /start command from user ID: {message.from_user.id}")
     await message.reply_text(
         "👋 Hello! Send or forward any video to me, and I will generate a high-speed streaming link for you."
     )
 
-@bot.on_message(filters.video | filters.document)
 async def handle_video(client, message):
     media = message.video or message.document
     if message.document and not message.document.mime_type.startswith("video/"):
@@ -105,6 +84,34 @@ async def handle_video(client, message):
         logger.error(f"Media processing failed: {e}")
         await status_msg.edit_text(f"❌ An error occurred during processing: {str(e)}")
 
+# --- LIFESPAN MANAGER ---
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global bot
+    logger.info("Initializing Pyrogram Client within Uvicorn loop...")
+    
+    # Initialize inside the active loop
+    bot = Client("stream_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+    
+    # Manually bind handlers to the active client
+    bot.add_handler(MessageHandler(start_cmd, filters.command("start")))
+    bot.add_handler(MessageHandler(handle_video, filters.video | filters.document))
+
+    await bot.start()
+    logger.info("Pyrogram successfully connected and dispatcher is running.")
+    
+    cleanup_task = asyncio.create_task(auto_cleanup_task())
+    
+    yield 
+    
+    logger.info("Stopping Pyrogram Client...")
+    cleanup_task.cancel()
+    await bot.stop()
+
+# Initialize FastAPI
+app = FastAPI(lifespan=lifespan)
+templates = Jinja2Templates(directory="templates")
+
 # --- WEB SERVER ROUTES ---
 @app.get("/player/{file_id}", response_class=HTMLResponse)
 async def video_player(request: Request, file_id: str):
@@ -125,5 +132,4 @@ async def get_file(file_id: str):
 
 # --- APP RUNNER ---
 if __name__ == "__main__":
-    # Handing control entirely to Uvicorn, which handles the async loops cleanly
     uvicorn.run("main:app", host="0.0.0.0", port=8000, log_level="info")
