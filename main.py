@@ -57,6 +57,8 @@ class ChunkCache:
                     self.cache.popitem(last=False)
 
 global_chunk_cache = ChunkCache()
+
+# Cache only immutable metadata, NOT the message object or file_id strings.
 metadata_cache = {}
 
 # --- CORE STREAMING LOGIC WITH BACKPRESSURE ---
@@ -81,8 +83,6 @@ async def fetch_metadata(file_id: int):
         "file_size": media.file_size,
         "file_name": getattr(media, "file_name", f"{file_id}.mp4"),
         "mime_type": media.mime_type or "video/mp4",
-        "msg_obj": msg,
-        "file_id_str": media.file_id  # Extract the raw string with the baked-in token
     }
     metadata_cache[file_id] = meta
     return meta
@@ -92,9 +92,12 @@ async def managed_stream_generator(client, file_id: int, start_byte, end_byte, r
     start_chunk = start_byte // chunk_size
     end_chunk = end_byte // chunk_size
     
-    # Grab the initial target file ID string from cache
-    meta = await fetch_metadata(file_id)
-    target_file_id_str = meta["file_id_str"]
+    # EXACT FIX: The assigned worker bot fetches its OWN fresh message object right now.
+    # This guarantees the file reference is cryptographically bound to this specific worker.
+    msg = await client.get_messages(WORKER_CHANNEL, file_id)
+    if not msg or not getattr(msg, "media", None):
+        logger.error(f"Worker could not access message {file_id}")
+        raise RuntimeError("Message access denied or deleted")
 
     try:
         for current_chunk_idx in range(start_chunk, end_chunk + 1):
@@ -111,8 +114,7 @@ async def managed_stream_generator(client, file_id: int, start_byte, end_byte, r
                 while retries > 0:
                     chunk_data = b""
                     try:
-                        # PASS THE RAW STRING, NOT THE MESSAGE OBJECT
-                        async for part in client.stream_media(target_file_id_str, limit=1, offset=current_chunk_idx):
+                        async for part in client.stream_media(msg, limit=1, offset=current_chunk_idx):
                             chunk_data += part
                         
                         if chunk_data:
@@ -127,23 +129,14 @@ async def managed_stream_generator(client, file_id: int, start_byte, end_byte, r
                             logger.error(f"Circuit breaker tripped: File ref for {file_id} constantly expiring.")
                             break
                         refresh_attempts += 1
-                        logger.warning(f"File reference expired for {file_id}. Main Bot fetching fresh token string...")
+                        logger.warning(f"File reference expired mid-stream. Worker fetching its own fresh token...")
                         
-                        # Main bot fetches the fresh message to guarantee a valid token
-                        fresh_msg = await bot.get_messages(WORKER_CHANNEL, file_id)
-                        fresh_media = getattr(fresh_msg, "video", None) or getattr(fresh_msg, "document", None)
-                        
-                        if fresh_media:
-                            # Update the target string with the newly baked token
-                            target_file_id_str = fresh_media.file_id 
-                            # Update the global cache
-                            if file_id in metadata_cache:
-                                metadata_cache[file_id]["msg_obj"] = fresh_msg
-                                metadata_cache[file_id]["file_id_str"] = target_file_id_str
-                            continue 
-                        else:
-                            logger.error(f"Failed to fetch fresh message for {file_id}. Message deleted?")
+                        # Worker refetches its own message to refresh its own token
+                        msg = await client.get_messages(WORKER_CHANNEL, file_id)
+                        if not msg or not getattr(msg, "media", None):
+                            logger.error(f"Worker failed to fetch fresh message for {file_id}.")
                             break
+                        continue 
                     except Exception as e:
                         logger.error(f"Error pulling chunk {current_chunk_idx}: {e}")
                         break
