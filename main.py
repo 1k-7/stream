@@ -33,6 +33,35 @@ bot = None
 workers = []
 worker_index = 0
 
+# --- TELEGRAM BOT HANDLERS ---
+async def start_cmd(client, message):
+    await message.reply_text("👋 Hello! Send me a video, and I'll route it through the streaming cluster.")
+
+async def handle_video(client, message):
+    media = message.video or message.document
+    if message.document and not message.document.mime_type.startswith("video/"):
+        return
+
+    status_msg = await message.reply_text("📥 *Indexing media into streaming cluster...*")
+    
+    try:
+        # Forward the file to the shared worker channel
+        forwarded_msg = await message.forward(WORKER_CHANNEL)
+        
+        stream_url = f"{DOMAIN}/player/{forwarded_msg.id}"
+        download_url = f"{DOMAIN}/file/{forwarded_msg.id}"
+        
+        await status_msg.edit_text(
+            f"🎬 *Stream Ready!*\n\n"
+            f"🔗 *Stream Link:* {stream_url}\n"
+            f"📥 *Download Link:* {download_url}\n\n"
+            f"⚙️ _Powered by Distributed Worker Pool_",
+            disable_web_page_preview=True
+        )
+    except Exception as e:
+        logger.error(f"Media routing failed: {e}")
+        await status_msg.edit_text(f"❌ Error routing media: {str(e)}")
+
 # --- SMART SLIDING WINDOW CACHE ---
 class ChunkCache:
     def __init__(self, max_chunks=256):
@@ -92,8 +121,6 @@ async def managed_stream_generator(client, file_id: int, start_byte, end_byte, r
     start_chunk = start_byte // chunk_size
     end_chunk = end_byte // chunk_size
     
-    # EXACT FIX: The assigned worker bot fetches its OWN fresh message object right now.
-    # This guarantees the file reference is cryptographically bound to this specific worker.
     msg = await client.get_messages(WORKER_CHANNEL, file_id)
     if not msg or not getattr(msg, "media", None):
         logger.error(f"Worker could not access message {file_id}")
@@ -131,7 +158,6 @@ async def managed_stream_generator(client, file_id: int, start_byte, end_byte, r
                         refresh_attempts += 1
                         logger.warning(f"File reference expired mid-stream. Worker fetching its own fresh token...")
                         
-                        # Worker refetches its own message to refresh its own token
                         msg = await client.get_messages(WORKER_CHANNEL, file_id)
                         if not msg or not getattr(msg, "media", None):
                             logger.error(f"Worker failed to fetch fresh message for {file_id}.")
@@ -164,6 +190,11 @@ async def lifespan(app: FastAPI):
     global bot
     logger.info("Initializing stream node master controller...")
     bot = Client("stream_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, workdir="sessions")
+    
+    # Restored Telegram Command Handlers
+    bot.add_handler(MessageHandler(start_cmd, filters.command("start")))
+    bot.add_handler(MessageHandler(handle_video, filters.video | filters.document))
+    
     await bot.start()
     
     tokens = [t.strip() for t in WORKER_TOKENS.split(",") if t.strip()]
