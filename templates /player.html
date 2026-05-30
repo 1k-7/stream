@@ -16,6 +16,12 @@
             justify-content: center;
             align-items: center;
             font-family: sans-serif;
+            font-size: 90%; 
+        }
+        h1, h2, h3, h4, h5, h6 {
+            /* Headings remain untouched */
+            color: #ffffff;
+            margin-bottom: 1rem;
         }
         .video-container {
             width: 100%;
@@ -25,72 +31,59 @@
             border-radius: 8px;
             overflow: hidden;
         }
-        /* Custom styling for Plyr to match modern dark look */
-        .plyr--video {
-            --plyr-color-main: #3b82f6;
-        }
+        .plyr--video { --plyr-color-main: #3b82f6; }
     </style>
 </head>
 <body>
 
 <div class="video-container">
-    <video id="player" playsinline controls crossorigin>
-        <source src="{{ video_url }}" type="video/mp4" />
-    </video>
+    <video id="player" playsinline controls crossorigin></video>
 </div>
 
+<script src="https://cdn.jsdelivr.net/npm/hls.js@1"></script>
 <script src="https://cdn.plyr.io/3.7.8/plyr.js"></script>
+
 <script>
     document.addEventListener('DOMContentLoaded', () => {
-        const player = new Plyr('#player', {
-            controls: [
-                'play-large', 'play', 'progress', 'current-time', 
-                'duration', 'mute', 'volume', 'settings', 'pip', 'fullscreen'
-            ],
+        const video = document.getElementById('player');
+        const source = "{{ video_url }}";
+        
+        const defaultOptions = {
+            controls: ['play-large', 'play', 'progress', 'current-time', 'duration', 'mute', 'volume', 'settings', 'pip', 'fullscreen'],
             seekTime: 10
-        });
+        };
 
-        const videoElement = document.getElementById('player');
-        const plyrContainer = document.querySelector('.plyr');
-
-        // 1. Double Tap to Seek (Mobile)
+        if (Hls.isSupported()) {
+            const hls = new Hls();
+            hls.loadSource(source);
+            
+            hls.on(Hls.Events.MANIFEST_PARSED, function () {
+                const player = new Plyr(video, defaultOptions);
+            });
+            hls.attachMedia(video);
+        } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+            // Fallback for native Apple devices (Safari)
+            video.src = source;
+            const player = new Plyr(video, defaultOptions);
+        }
+        
+        // Double-tap seek logic remains identical
+        const plyrContainer = document.querySelector('.video-container');
         let lastTap = 0;
         plyrContainer.addEventListener('touchend', function (e) {
             const currentTime = new Date().getTime();
             const tapLength = currentTime - lastTap;
-            
             if (tapLength < 300 && tapLength > 0) {
-                // Prevent default behavior like zoom
                 e.preventDefault();
-                
                 const rect = plyrContainer.getBoundingClientRect();
                 const touchX = e.changedTouches[0].clientX - rect.left;
-                const midPoint = rect.width / 2;
-
-                if (touchX < midPoint) {
-                    // Left side double-tap: Rewind 10s
-                    player.rewind(10);
+                if (touchX < (rect.width / 2)) {
+                    video.currentTime -= 10;
                 } else {
-                    // Right side double-tap: Forward 10s
-                    player.forward(10);
+                    video.currentTime += 10;
                 }
             }
             lastTap = currentTime;
-        });
-
-        // 2. Auto-Rotate on Fullscreen (Mobile)
-        player.on('enterfullscreen', () => {
-            if (screen.orientation && screen.orientation.lock) {
-                screen.orientation.lock('landscape').catch((err) => {
-                    console.log("Orientation lock not supported or allowed:", err);
-                });
-            }
-        });
-
-        player.on('exitfullscreen', () => {
-            if (screen.orientation && screen.orientation.unlock) {
-                screen.orientation.unlock();
-            }
         });
     });
 </script>
