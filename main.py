@@ -81,18 +81,20 @@ async def fetch_metadata(file_id: int):
         "file_size": media.file_size,
         "file_name": getattr(media, "file_name", f"{file_id}.mp4"),
         "mime_type": media.mime_type or "video/mp4",
-        "msg_obj": msg
+        "msg_obj": msg,
+        "file_id_str": media.file_id  # Extract the raw string with the baked-in token
     }
     metadata_cache[file_id] = meta
     return meta
 
-async def managed_stream_generator(client, msg, start_byte, end_byte, request: Request):
+async def managed_stream_generator(client, file_id: int, start_byte, end_byte, request: Request):
     chunk_size = 1024 * 1024
     start_chunk = start_byte // chunk_size
     end_chunk = end_byte // chunk_size
-    file_id = msg.id
     
-    msg_obj = msg 
+    # Grab the initial target file ID string from cache
+    meta = await fetch_metadata(file_id)
+    target_file_id_str = meta["file_id_str"]
 
     try:
         for current_chunk_idx in range(start_chunk, end_chunk + 1):
@@ -109,7 +111,8 @@ async def managed_stream_generator(client, msg, start_byte, end_byte, request: R
                 while retries > 0:
                     chunk_data = b""
                     try:
-                        async for part in client.stream_media(msg_obj, limit=1, offset=current_chunk_idx):
+                        # PASS THE RAW STRING, NOT THE MESSAGE OBJECT
+                        async for part in client.stream_media(target_file_id_str, limit=1, offset=current_chunk_idx):
                             chunk_data += part
                         
                         if chunk_data:
@@ -124,18 +127,22 @@ async def managed_stream_generator(client, msg, start_byte, end_byte, request: R
                             logger.error(f"Circuit breaker tripped: File ref for {file_id} constantly expiring.")
                             break
                         refresh_attempts += 1
-                        logger.warning(f"File reference expired for {file_id}. Worker fetching its own fresh token...")
+                        logger.warning(f"File reference expired for {file_id}. Main Bot fetching fresh token string...")
                         
-                        # CRITICAL FIX: The active worker bot fetches the message to get a session-bound token
-                        fresh_msg = await client.get_messages(WORKER_CHANNEL, file_id)
-                        if fresh_msg and getattr(fresh_msg, "media", None):
-                            msg_obj = fresh_msg
-                            # Update global cache so subsequent chunks process smoothly
+                        # Main bot fetches the fresh message to guarantee a valid token
+                        fresh_msg = await bot.get_messages(WORKER_CHANNEL, file_id)
+                        fresh_media = getattr(fresh_msg, "video", None) or getattr(fresh_msg, "document", None)
+                        
+                        if fresh_media:
+                            # Update the target string with the newly baked token
+                            target_file_id_str = fresh_media.file_id 
+                            # Update the global cache
                             if file_id in metadata_cache:
-                                metadata_cache[file_id]["msg_obj"] = msg_obj
+                                metadata_cache[file_id]["msg_obj"] = fresh_msg
+                                metadata_cache[file_id]["file_id_str"] = target_file_id_str
                             continue 
                         else:
-                            logger.error(f"Worker failed to fetch fresh message for {file_id}.")
+                            logger.error(f"Failed to fetch fresh message for {file_id}. Message deleted?")
                             break
                     except Exception as e:
                         logger.error(f"Error pulling chunk {current_chunk_idx}: {e}")
@@ -227,7 +234,7 @@ async def stream_file(request: Request, file_id: int, range: str = Header(None))
     }
 
     return StreamingResponse(
-        managed_stream_generator(get_worker(), meta["msg_obj"], start, end, request),
+        managed_stream_generator(get_worker(), file_id, start, end, request),
         status_code=status_code,
         headers=headers
     )
