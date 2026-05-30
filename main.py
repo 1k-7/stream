@@ -91,6 +91,8 @@ async def managed_stream_generator(client, msg, start_byte, end_byte, request: R
     start_chunk = start_byte // chunk_size
     end_chunk = end_byte // chunk_size
     file_id = msg.id
+    
+    msg_obj = msg 
 
     try:
         for current_chunk_idx in range(start_chunk, end_chunk + 1):
@@ -103,10 +105,11 @@ async def managed_stream_generator(client, msg, start_byte, end_byte, request: R
 
             if not chunk_data:
                 retries = 3
+                refresh_attempts = 0
                 while retries > 0:
                     chunk_data = b""
                     try:
-                        async for part in client.stream_media(msg, limit=1, offset=current_chunk_idx):
+                        async for part in client.stream_media(msg_obj, limit=1, offset=current_chunk_idx):
                             chunk_data += part
                         
                         if chunk_data:
@@ -117,16 +120,22 @@ async def managed_stream_generator(client, msg, start_byte, end_byte, request: R
                         await asyncio.sleep(fw.value)
                         retries -= 1
                     except FileReferenceExpired:
-                        logger.warning(f"File reference expired for {file_id}. Refreshing token...")
-                        # Re-fetch the message to get a fresh temporary download token
-                        msg = await client.get_messages(WORKER_CHANNEL, file_id)
-                        if msg and getattr(msg, "media", None):
-                            # Update the global cache so future chunks don't hit the same error
+                        if refresh_attempts >= 2:
+                            logger.error(f"Circuit breaker tripped: File ref for {file_id} constantly expiring.")
+                            break
+                        refresh_attempts += 1
+                        logger.warning(f"File reference expired for {file_id}. Worker fetching its own fresh token...")
+                        
+                        # CRITICAL FIX: The active worker bot fetches the message to get a session-bound token
+                        fresh_msg = await client.get_messages(WORKER_CHANNEL, file_id)
+                        if fresh_msg and getattr(fresh_msg, "media", None):
+                            msg_obj = fresh_msg
+                            # Update global cache so subsequent chunks process smoothly
                             if file_id in metadata_cache:
-                                metadata_cache[file_id]["msg_obj"] = msg
-                            continue # Retry chunk extraction with the new token
+                                metadata_cache[file_id]["msg_obj"] = msg_obj
+                            continue 
                         else:
-                            logger.error(f"Failed to refresh file {file_id}. It may have been deleted.")
+                            logger.error(f"Worker failed to fetch fresh message for {file_id}.")
                             break
                     except Exception as e:
                         logger.error(f"Error pulling chunk {current_chunk_idx}: {e}")
