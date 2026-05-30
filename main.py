@@ -21,10 +21,13 @@ DOMAIN = os.environ.get("DOMAIN", "https://yourdomain.com")
 WORKER_CHANNEL = int(os.environ.get("WORKER_CHANNEL", "0"))
 WORKER_TOKENS = os.environ.get("WORKER_TOKENS", "")
 
+# Absolute path for templates
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
 # --- GLOBALS ---
 bot = None
-workers = []  # Pool of Pyrogram Client objects
-worker_index = 0  # Used for Round-Robin selection
+workers = []
+worker_index = 0
 
 # --- TELEGRAM BOT HANDLERS ---
 async def start_cmd(client, message):
@@ -57,16 +60,14 @@ async def handle_video(client, message):
 
 # --- STREAMING CORE ---
 def get_worker():
-    """Round-robin worker selection for load balancing."""
     global worker_index
     if not workers:
-        return bot  # Fallback to main bot if no workers are configured
+        return bot
     worker = workers[worker_index % len(workers)]
     worker_index += 1
     return worker
 
 async def stream_generator(client, message_id, offset, limit):
-    """Fetches chunks dynamically from Telegram's MTProto servers."""
     try:
         msg = await client.get_messages(WORKER_CHANNEL, message_id)
         if not msg or not (msg.video or msg.document):
@@ -90,15 +91,30 @@ async def lifespan(app: FastAPI):
     bot.add_handler(MessageHandler(handle_video, filters.video | filters.document))
 
     await bot.start()
-    logger.info("Main Bot online.")
     
-    # Initialize worker bots from environment variable
+    # 1. Force Peer Caching for Main Bot
+    try:
+        init_msg = await bot.send_message(WORKER_CHANNEL, "🔄 System Boot: Caching Main Bot Peer")
+        await init_msg.delete()
+        logger.info("Main Bot peer cached successfully.")
+    except Exception as e:
+        logger.error(f"Failed to cache peer for main bot: {e}")
+
+    # 2. Initialize and Cache Worker Bots
     tokens = [t.strip() for t in WORKER_TOKENS.split(",") if t.strip()]
     for token in tokens:
         try:
             bot_id = token.split(":")[0]
             w_client = Client(f"worker_{bot_id}", api_id=API_ID, api_hash=API_HASH, bot_token=token, in_memory=True)
             await w_client.start()
+            
+            # Force Peer Caching for Worker Bot
+            try:
+                w_init_msg = await w_client.send_message(WORKER_CHANNEL, f"🔄 System Boot: Caching Worker {bot_id}")
+                await w_init_msg.delete()
+            except Exception as e:
+                logger.error(f"Failed to cache peer for worker {bot_id}: {e}")
+                
             workers.append(w_client)
         except Exception as e:
             logger.error(f"Failed to start worker bot {token[:10]}... : {e}")
@@ -113,7 +129,9 @@ async def lifespan(app: FastAPI):
     await bot.stop()
 
 app = FastAPI(lifespan=lifespan)
-templates = Jinja2Templates(directory="templates")
+
+# Bind Jinja2 to the absolute path
+templates = Jinja2Templates(directory=os.path.join(BASE_DIR, "templates"))
 
 @app.get("/player/{file_id}", response_class=HTMLResponse)
 async def video_player(request: Request, file_id: int):
