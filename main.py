@@ -11,7 +11,7 @@ from fastapi.templating import Jinja2Templates
 from fastapi.middleware.cors import CORSMiddleware
 from pyrogram import Client, filters
 from pyrogram.handlers import MessageHandler
-from pyrogram.errors import FloodWait
+from pyrogram.errors import FloodWait, FileReferenceExpired
 import uvicorn
 
 # --- LOGGING ---
@@ -96,8 +96,6 @@ async def managed_stream_generator(client, msg, start_byte, end_byte, request: R
         for current_chunk_idx in range(start_chunk, end_chunk + 1):
             if await request.is_disconnected():
                 logger.info(f"Client disconnected. Aborting stream for file {file_id}.")
-                # Raising an error forces Uvicorn to drop the connection rather than
-                # trying to resolve the missing Content-Length bytes.
                 raise asyncio.CancelledError("Client disconnected")
 
             cache_key = f"{file_id}_{current_chunk_idx}"
@@ -118,13 +116,24 @@ async def managed_stream_generator(client, msg, start_byte, end_byte, request: R
                         logger.warning(f"Rate limited. Waiting {fw.value}s...")
                         await asyncio.sleep(fw.value)
                         retries -= 1
+                    except FileReferenceExpired:
+                        logger.warning(f"File reference expired for {file_id}. Refreshing token...")
+                        # Re-fetch the message to get a fresh temporary download token
+                        msg = await client.get_messages(WORKER_CHANNEL, file_id)
+                        if msg and getattr(msg, "media", None):
+                            # Update the global cache so future chunks don't hit the same error
+                            if file_id in metadata_cache:
+                                metadata_cache[file_id]["msg_obj"] = msg
+                            continue # Retry chunk extraction with the new token
+                        else:
+                            logger.error(f"Failed to refresh file {file_id}. It may have been deleted.")
+                            break
                     except Exception as e:
                         logger.error(f"Error pulling chunk {current_chunk_idx}: {e}")
                         break
 
             if not chunk_data:
                 logger.error(f"Failed to fetch chunk {current_chunk_idx} from Telegram.")
-                # Missing chunk data must trigger an exception to avoid HTTP protocol mismatch
                 raise RuntimeError("Missing chunk data")
 
             chunk_start_byte = current_chunk_idx * chunk_size
@@ -135,7 +144,7 @@ async def managed_stream_generator(client, msg, start_byte, end_byte, request: R
 
     except asyncio.CancelledError:
         logger.info("Stream playback task cancelled by client request.")
-        raise  # Re-raise to gracefully sever the HTTP pipeline
+        raise
     except Exception as e:
         logger.error(f"Streaming loop failure: {e}")
         raise  
